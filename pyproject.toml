@@ -1,4 +1,6 @@
 [project]
+[tool.uv.required-environments]
+linux_x86_64 = true
 name = "uv-cloudflare-workers-example"
 version = "0.0.1"
 readme = "README.md"
