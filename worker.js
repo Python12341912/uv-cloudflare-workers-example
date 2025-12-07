@@ -1,9 +1,9 @@
-const WORKER_BASE = ""; // leave empty for workers.dev root; or set like "/service/"
 const ROUTE_PREFIX = "/service/";
 
-/**
- * Resolve relative URLs to absolute using a base.
- */
+function toProxiedPath(target) {
+  return `${ROUTE_PREFIX}${encodeURIComponent(target)}`;
+}
+
 function resolveUrl(base, rel) {
   try {
     return new URL(rel, base).toString();
@@ -12,130 +12,148 @@ function resolveUrl(base, rel) {
   }
 }
 
-/**
- * Encode target URL for path segment.
- */
-function encodeTarget(u) {
-  return encodeURIComponent(u);
-}
-
-/**
- * Build proxied URL path for a target.
- */
-function toProxiedPath(target) {
-  return `${ROUTE_PREFIX}${encodeTarget(target)}`;
-}
-
-/**
- * Basic HTML rewrite: update href/src/action attributes to route through the Worker.
- */
 function htmlRewriter(targetOrigin) {
-  const rw = new HTMLRewriter()
+  return new HTMLRewriter()
+    // Anchor tags
     .on('a[href]', {
       element(el) {
         const href = el.getAttribute('href');
         if (!href) return;
-        const abs = resolveUrl(targetOrigin, href);
-        el.setAttribute('href', toProxiedPath(abs));
+        el.setAttribute('href', toProxiedPath(resolveUrl(targetOrigin, href)));
       }
     })
-    .on('link[href]', {
-      element(el) {
-        const href = el.getAttribute('href');
-        if (!href) return;
-        const abs = resolveUrl(targetOrigin, href);
-        el.setAttribute('href', toProxiedPath(abs));
-      }
-    })
-    .on('script[src]', {
-      element(el) {
-        const src = el.getAttribute('src');
-        if (!src) return;
-        const abs = resolveUrl(targetOrigin, src);
-        el.setAttribute('src', toProxiedPath(abs));
-      }
-    })
-    .on('img[src]', {
-      element(el) {
-        const src = el.getAttribute('src');
-        if (!src) return;
-        const abs = resolveUrl(targetOrigin, src);
-        el.setAttribute('src', toProxiedPath(abs));
-      }
-    })
+    // Forms
     .on('form[action]', {
       element(el) {
         const action = el.getAttribute('action');
         if (!action) return;
-        const abs = resolveUrl(targetOrigin, action);
-        el.setAttribute('action', toProxiedPath(abs));
-        // Force target to _self so it stays in the proxied context
+        el.setAttribute('action', toProxiedPath(resolveUrl(targetOrigin, action)));
         el.setAttribute('target', '_self');
       }
+    })
+    // Iframes
+    .on('iframe[src]', {
+      element(el) {
+        const src = el.getAttribute('src');
+        if (!src) return;
+        el.setAttribute('src', toProxiedPath(resolveUrl(targetOrigin, src)));
+      }
+    })
+    // Images
+    .on('img[src]', {
+      element(el) {
+        const src = el.getAttribute('src');
+        if (!src) return;
+        el.setAttribute('src', toProxiedPath(resolveUrl(targetOrigin, src)));
+      }
+    })
+    // Responsive images: srcset
+    .on('img[srcset], source[srcset]', {
+      element(el) {
+        const srcset = el.getAttribute('srcset');
+        if (!srcset) return;
+        const rewritten = srcset.split(',').map(part => {
+          const [u, w] = part.trim().split(/\s+/);
+          const abs = resolveUrl(targetOrigin, u);
+          return `${toProxiedPath(abs)}${w ? " " + w : ""}`;
+        }).join(', ');
+        el.setAttribute('srcset', rewritten);
+      }
+    })
+    // picture/source src
+    .on('source[src]', {
+      element(el) {
+        const src = el.getAttribute('src');
+        if (!src) return;
+        el.setAttribute('src', toProxiedPath(resolveUrl(targetOrigin, src)));
+      }
+    })
+    // Scripts
+    .on('script[src]', {
+      element(el) {
+        const src = el.getAttribute('src');
+        if (!src) return;
+        el.setAttribute('src', toProxiedPath(resolveUrl(targetOrigin, src)));
+      }
+    })
+    // Stylesheets
+    .on('link[rel="stylesheet"][href], link[href]', {
+      element(el) {
+        const href = el.getAttribute('href');
+        if (!href) return;
+        el.setAttribute('href', toProxiedPath(resolveUrl(targetOrigin, href)));
+      }
+    })
+    // Inline style url(...) (best-effort for style attributes)
+    .on('[style]', {
+      element(el) {
+        const style = el.getAttribute('style');
+        if (!style) return;
+        const rewritten = style.replace(/url\((['"]?)([^'")]+)\1\)/g, (_m, _q, u) => {
+          if (u.startsWith('data:')) return _m;
+          const abs = resolveUrl(targetOrigin, u);
+          return `url(${toProxiedPath(abs)})`;
+        });
+        el.setAttribute('style', rewritten);
+      }
+    })
+    // Meta refresh
+    .on('meta[http-equiv="refresh"]', {
+      element(el) {
+        const content = el.getAttribute('content');
+        if (!content) return;
+        const match = content.match(/\d+;\s*url=(.+)/i);
+        if (match) {
+          const abs = resolveUrl(targetOrigin, match[1]);
+          el.setAttribute('content', content.replace(match[1], toProxiedPath(abs)));
+        }
+      }
     });
-
-  return rw;
 }
 
-/**
- * Loosen or strip problematic headers so pages render.
- */
-function sanitizeHeaders(headers, contentTypeIsHtml) {
-  const h = new Headers(headers);
+// Rewrite CSS url(...) including fonts/backgrounds
+async function rewriteCss(resp, targetOrigin) {
+  const cssText = await resp.text();
+  const rewritten = cssText.replace(/url\((['"]?)([^'")]+)\1\)/g, (match, quote, url) => {
+    if (url.startsWith("data:")) return match;
+    const abs = resolveUrl(targetOrigin, url);
+    return `url(${toProxiedPath(abs)})`;
+  });
+  const headers = new Headers(resp.headers);
+  headers.set("content-type", "text/css; charset=utf-8");
+  sanitizeHeadersInPlace(headers);
+  return new Response(rewritten, { status: resp.status, headers });
+}
 
-  // Remove strict CSP that blocks rendering within proxy context
-  if (h.has('content-security-policy')) h.delete('content-security-policy');
-  if (h.has('content-security-policy-report-only')) h.delete('content-security-policy-report-only');
-
-  // CORS: allow same-origin from the worker URL
+function sanitizeHeadersInPlace(h) {
+  h.delete('content-security-policy');
+  h.delete('content-security-policy-report-only');
+  h.delete('x-frame-options');
   h.set('access-control-allow-origin', '*');
   h.set('access-control-allow-headers', '*');
   h.set('access-control-allow-methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-
-  // Disable frame options that could blank pages
-  if (h.has('x-frame-options')) h.delete('x-frame-options');
-
-  // Some sites set nosniff that can interfere in transformed contexts
-  if (h.has('x-content-type-options')) h.delete('x-content-type-options');
-
-  // Keep content-type intact; for HTML, ensure text/html charset is present
-  if (contentTypeIsHtml) {
-    const ct = h.get('content-type') || 'text/html; charset=utf-8';
-    if (!/text\/html/i.test(ct)) h.set('content-type', 'text/html; charset=utf-8');
-  }
-
-  return h;
 }
 
 export default {
   async fetch(request) {
     const url = new URL(request.url);
 
-    // Health/info
-    if (url.pathname === "/" || url.pathname === WORKER_BASE) {
-      return new Response("Ultraviolet-style Worker: use /service/<encodedURL>", { status: 200 });
-    }
-
-    // Only handle /service/<encodedURL>
     if (!url.pathname.startsWith(ROUTE_PREFIX)) {
-      return new Response("Not found. Use /service/<encodedURL>", { status: 404 });
+      return new Response("Boat Proxy Worker ready. Use /service/<encodedURL>", { status: 200 });
     }
 
-    // Decode target
     const encoded = url.pathname.slice(ROUTE_PREFIX.length);
-    if (!encoded) {
-      return new Response("Missing encoded URL", { status: 400 });
-    }
+    if (!encoded) return new Response("Missing encoded URL", { status: 400 });
 
     let target;
-    try {
-      target = decodeURIComponent(encoded);
-    } catch {
-      return new Response("Bad encoded URL", { status: 400 });
+    try { target = decodeURIComponent(encoded); }
+    catch { return new Response("Bad encoded URL", { status: 400 }); }
+
+    // Prevent recursion (proxying the worker’s own origin)
+    if (target.startsWith(url.origin)) {
+      return new Response("Refusing to proxy worker origin", { status: 400 });
     }
 
-    // Prepare request to target
-    // Forward method, headers, and body for non-GET/HEAD
     const init = {
       method: request.method,
       headers: request.headers,
@@ -144,43 +162,29 @@ export default {
       init.body = request.body;
     }
 
-    // Avoid recursive calls to the worker itself
-    if (target.startsWith(url.origin)) {
-      return new Response("Refusing to proxy this origin", { status: 400 });
-    }
-
-    let resp;
+    let upstream;
     try {
-      resp = await fetch(target, init);
+      upstream = await fetch(target, init);
     } catch (err) {
-      return new Response(`Upstream fetch error: ${err}`, { status: 502 });
+      return new Response("Upstream fetch error: " + err, { status: 502 });
     }
 
-    // Handle opaque/cors-restricted responses gracefully
-    if (resp.type === "opaque") {
-      return new Response("Opaque upstream response; try a different site", { status: 502 });
+    const ct = upstream.headers.get('content-type') || '';
+    const lowerCT = ct.toLowerCase();
+    const headers = new Headers(upstream.headers);
+    sanitizeHeadersInPlace(headers);
+
+    if (lowerCT.includes('text/html')) {
+      const rewritten = htmlRewriter(new URL(target).toString()).transform(upstream);
+      headers.set("content-type", "text/html; charset=utf-8");
+      return new Response(rewritten.body, { status: upstream.status, headers });
     }
 
-    const ct = resp.headers.get('content-type') || '';
-    const isHtml = ct.toLowerCase().includes('text/html');
-
-    // Sanitize headers
-    const safeHeaders = sanitizeHeaders(resp.headers, isHtml);
-
-    // For HTML, rewrite URLs to pass back through /service/
-    if (isHtml) {
-      const targetOrigin = new URL(target).toString();
-      const transformed = htmlRewriter(targetOrigin).transform(resp);
-      return new Response(transformed.body, {
-        status: resp.status,
-        headers: safeHeaders
-      });
+    if (lowerCT.includes('text/css')) {
+      return rewriteCss(upstream, new URL(target).toString());
     }
 
-    // Otherwise stream as-is (CSS/JS/images/etc.)
-    return new Response(resp.body, {
-      status: resp.status,
-      headers: safeHeaders
-    });
+    // Stream other assets untouched with original content-type
+    return new Response(upstream.body, { status: upstream.status, headers });
   }
 };
