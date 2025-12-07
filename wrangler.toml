@@ -1,6 +1,9 @@
 name = "uv-worker"
-main = "index.js"
+main = "worker.js"
 compatibility_date = "2025-12-07"
+# Optional: Enable HTMLRewriter streams for performance
+compatibility_flags = ["nodejs_compat"]
+
 
 [observability.logs]
 enabled = true
